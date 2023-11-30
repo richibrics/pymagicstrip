@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 from bleak import BleakClient
+from bleak.backends.bluezdbus.client import BleakClientBlueZDBus
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 from bleak.exc import BleakError
@@ -29,7 +30,7 @@ _LOGGER.setLevel(logging.DEBUG)
 
 
 def device_filter(device: BLEDevice, advertisement_data: AdvertisementData) -> bool:
-    """Bleak discovery notification device filter."""
+    """Return True if device is a MagicStrip device."""
 
     if device.name.lower() in [
         d.lower() for d in const.HARDCODED_NAMES
@@ -40,7 +41,7 @@ def device_filter(device: BLEDevice, advertisement_data: AdvertisementData) -> b
 
 
 def _judge_rssi(rssi: int | None) -> str | None:
-    """Return qualatative assessment of RSSI."""
+    """Return qualitative assessment of RSSI."""
 
     if rssi is None:
         return None
@@ -69,18 +70,18 @@ class MagicStripState:
     effect: str | None = None
     effect_speed: int | None = None
     rssi: int | None = None
-    event = asyncio.Event()
 
     def replace_from_notification(
         self, on: bool, brightness: int, **changes: Any
     ) -> MagicStripState:
         """Update state based on device notification."""
 
+        # New object returned, since this is a dataclass.
         return replace(self, on=on, brightness=brightness, **changes)
 
     @property
     def connection_quality(self) -> str | None:
-        """Get connection quality."""
+        """Get connection quality as a ordinal string value."""
 
         return _judge_rssi(self.rssi)
 
@@ -100,32 +101,41 @@ class MagicStripDevice:
         self.state = MagicStripState()
         self.lock = asyncio.Lock()
         self._client = BleakClient(self.ble_device)
-        self._client_count = 0
+        self._client.set_disconnected_callback(self._on_disconnect)
+        self._is_connected = False
 
     async def __aenter__(self) -> MagicStripDevice:
         """Enter context."""
-        async with self.lock:
-            if self._client_count == 0:
-                try:
-                    await self._client.__aenter__()
-                except (asyncio.TimeoutError, asyncio.exceptions.TimeoutError) as exc:
-                    _LOGGER.debug("Timeout on connect", exc_info=True)
-                    raise BleTimeoutError("Timeout on connect") from exc
-                except asyncio.CancelledError as exc:
-                    _LOGGER.debug("Connection cancelled", exc_info=True)
-                    raise BleTimeoutError("Connection cancelled") from exc
-                except BleakError as exc:
-                    _LOGGER.debug("Error on connect", exc_info=True)
-                    raise BleConnectionError("Error on connect") from exc
-            self._client_count += 1
-            return self
+        if not self._is_connected:
+            try:
+                print("Connecting to device")
+                await self._client.__aenter__()
+            except (asyncio.TimeoutError, asyncio.exceptions.TimeoutError) as exc:
+                _LOGGER.debug("Timeout on connect", exc_info=True)
+                raise BleTimeoutError("Timeout on connect") from exc
+            except asyncio.CancelledError as exc:
+                _LOGGER.debug("Connection cancelled", exc_info=True)
+                raise BleTimeoutError("Connection cancelled") from exc
+            except BleakError as exc:
+                _LOGGER.debug("Error on connect", exc_info=True)
+                raise BleConnectionError("Error on connect") from exc
+            self._is_connected = True
+            _LOGGER.info("Device connected.")
+        return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore
         """Exit context."""
-        async with self.lock:
-            self._client_count -= 1
-            if self._client_count == 0:
-                await self._client.__aexit__(exc_type, exc_val, exc_tb)
+        pass  # avoid manual disconnect after each command
+
+    async def disconnect(self) -> None:
+        """Disconnect from device."""
+        await self._client.disconnect()
+
+    def _on_disconnect(self, dbus: BleakClientBlueZDBus) -> None:
+        """Callback called when Bleak notices the device disconnected."""
+        if dbus.address == self.address:
+            _LOGGER.info("Device disconnected.")
+            self._is_connected = False
 
     async def _onoff_notification_handler(self, sender, data) -> None:  # type: ignore
         """Handle HCI event notifications."""
@@ -152,7 +162,6 @@ class MagicStripDevice:
                 const.STATUS_REGEX, status_str := bytearray.hex(data)
             )
         ) is not None:
-
             on = status_components.group(1) == "01"
             brightness = int(status_components.group(2), 16)
 
@@ -178,20 +187,23 @@ class MagicStripDevice:
     @property
     def address(self) -> str:
         """Return address of the device."""
+        # If string, return it since it is the address, otherwise get the address from the BLE device
         if isinstance(self.ble_device, str):
             return self.ble_device
         return str(self.ble_device.address)
 
     async def _send_command(self, cmd: str | list, attempts: int = 1) -> None:
-        """Send given command."""
+        """Send given command(s) to the BLE Strip device."""
 
         if isinstance(cmd, list):
             for cmd_single in cmd:
+                # recursive call with single elements of the commands list
                 await self._send_command(cmd_single)
             return
 
-        async with self:
-            async with self.lock:
+        # when "async with self" is used, the methods __aenter__ and __aexit__ are called (before and after respectively)
+        async with self.lock:
+            async with self:
                 try:
                     _LOGGER.debug("Sending command: %s", cmd)
                     await self._client.write_gatt_char(
@@ -236,6 +248,7 @@ class MagicStripDevice:
 
         await self._send_command(f"03{''.join(f'{i:02x}' for i in (red, green, blue))}")
 
+        # new state is set with just set color
         self.state = replace(
             self.state, color=(red, green, blue), effect_speed=None, effect=None
         )
@@ -248,6 +261,7 @@ class MagicStripDevice:
 
         await self._send_command(f"08{''.join(f'{brightness:02x}')}")
 
+        # new state is set with just set brightness
         self.state = replace(self.state, brightness=brightness)
 
         await self.update()
@@ -262,6 +276,7 @@ class MagicStripDevice:
             effect_cmd = EFFECTS[effect]
             await self._send_command(effect_cmd)
 
+        # new state is set with just set effect
         self.state = replace(self.state, effect=effect, color=None)
 
     async def set_effect_speed(self, speed: int) -> None:
@@ -275,6 +290,7 @@ class MagicStripDevice:
 
         speed_cmd = f"09{inv_speed:02x}"
 
+        # new state is set with just set effect speed
         self.state = replace(self.state, effect_speed=speed)
 
         await self._send_command(speed_cmd)
@@ -305,8 +321,8 @@ class MagicStripDevice:
 
         _LOGGER.debug("Refreshing state.")
 
-        async with self:
-            async with self.lock:
+        async with self.lock:
+            async with self:
                 try:
                     await self._client.start_notify(
                         CHARACTERISTIC_UUID, self._onoff_notification_handler
