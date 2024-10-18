@@ -94,33 +94,35 @@ class MagicStripState:
 
 class MagicStripDevice:
     """Communication handler."""
-
+    
     def __init__(self, device: BLEDevice | str) -> None:
         """Initialize handler."""
+        _LOGGER.debug("Initializing MagicStripDevice.")
         self.ble_device = device
         self.state = MagicStripState()
         self.lock = asyncio.Lock()
         self._client = BleakClient(self.ble_device)
         self._client.set_disconnected_callback(self._on_disconnect)
         self._is_connected = False
+        self._retry_interval = 5  # Interval in seconds between retries
 
     async def __aenter__(self) -> MagicStripDevice:
-        """Enter context."""
-        if not self._is_connected:
+        """Enter context, retrying connection until successful."""
+        while not self._is_connected:
             try:
-                print("Connecting to device")
+                _LOGGER.info("Attempting to connect to the device...")
                 await self._client.__aenter__()
+                self._is_connected = True
+                _LOGGER.info("Device connected successfully.")
             except (asyncio.TimeoutError, asyncio.exceptions.TimeoutError) as exc:
-                _LOGGER.debug("Timeout on connect", exc_info=True)
-                raise BleTimeoutError("Timeout on connect") from exc
+                _LOGGER.warning("Timeout on connect, retrying in %d seconds...", self._retry_interval)
+                await asyncio.sleep(self._retry_interval)
             except asyncio.CancelledError as exc:
-                _LOGGER.debug("Connection cancelled", exc_info=True)
-                raise BleTimeoutError("Connection cancelled") from exc
+                _LOGGER.warning("Connection cancelled, retrying in %d seconds...", self._retry_interval)
+                await asyncio.sleep(self._retry_interval)
             except BleakError as exc:
-                _LOGGER.debug("Error on connect", exc_info=True)
-                raise BleConnectionError("Error on connect") from exc
-            self._is_connected = True
-            _LOGGER.info("Device connected.")
+                _LOGGER.warning("Error on connect: %s. Retrying in %d seconds...", exc, self._retry_interval)
+                await asyncio.sleep(self._retry_interval)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore
